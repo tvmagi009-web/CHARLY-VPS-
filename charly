@@ -8,6 +8,7 @@ C='\033[1;36m'
 M='\033[1;35m'
 W='\033[1;37m'
 N='\033[0m'
+source /etc/CHARLY/modules/charly-id.sh 2>/dev/null || true
 
 linea() {
     echo -e "${M}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -1642,9 +1643,14 @@ menu_badvpn() {
 
             6)
                 echo
-                echo -e "${C}PUERTOS ACTIVOS EN TODO EL VPS:${N}"
-                echo
-                ss -lntup 2>/dev/null || echo "No se pudieron consultar los puertos."
+                if systemctl is-active --quiet badvpn; then
+                    puerto=$(charly_badvpn_puerto)
+                    echo -e "${G}BADVPN ACTIVO${N}"
+                    echo -e " ${C}Puerto configurado:${N} 127.0.0.1:${Y}${puerto}${N}"
+                else
+                    echo -e "${R}BADVPN NO ESTÁ ACTIVO${N}"
+                    echo "No hay un puerto activo para BADVPN."
+                fi
                 echo
                 read -r -p "Presione Enter para continuar..."
                 ;;
@@ -229596,6 +229602,17 @@ menu_slipstream() {
 }
 # ===== END CHARLY SLIPGATE + SLIPSTREAM MODULE =====
 
+charly_estado_motor() {
+    local unidad="$1" binario="$2" proceso="$3"
+    if [[ ! -x "$binario" ]] && ! systemctl cat "$unidad" >/dev/null 2>&1; then
+        printf 'NO INSTALADO'
+    elif systemctl is-active --quiet "$unidad" || pgrep -x "$proceso" >/dev/null 2>&1; then
+        printf 'ON'
+    else
+        printf 'OFF'
+    fi
+}
+
 menu_instaladores() {
     local op
     while true; do
@@ -229608,11 +229625,11 @@ menu_instaladores() {
         linea
         charly_resumen_puertos
         echo
-        printf " ${B}┌────────────────────────────┬────────────────────────────┐${N}\n"
-        printf " ${B}│${N} ${C}[01]${N} ⚙  AJUSTES SSH          ${B}│${N} ${C}[02]${N} 🛡  DROPBEAR             ${B}│${N}\n"
-        printf " ${B}│${N} ${C}[03]${N} 🌐 BHTTP-SN             ${B}│${N} ${C}[04]${N} ⚡ BADVPN-UDPGW         ${B}│${N}\n"
-        printf " ${B}│${N} ${C}[05]${N} 🔥 HCR                  ${B}│${N} ${C}[06]${N} 🌐 SLIPSTREAM           ${B}│${N}\n"
-        printf " ${B}└────────────────────────────┴────────────────────────────┘${N}\n"
+        printf " ${B}┌──────────────────────────────────────────────────┬──────────────────────────────────────────────────┐${N}\n"
+        printf " ${B}│${N} %-48s ${B}│${N} %-48s ${B}│${N}\n" "[01] AJUSTES SSH: $(charly_estado_motor ssh /usr/sbin/sshd sshd)" "[02] DROPBEAR: $(charly_estado_motor dropbear /usr/sbin/dropbear dropbear)"
+        printf " ${B}│${N} %-48s ${B}│${N} %-48s ${B}│${N}\n" "[03] BHTTP-SN: $(charly_estado_motor bhttp-sn /usr/local/bin/bhttp-sn bhttp-sn)" "[04] BADVPN-UDPGW: $(charly_estado_motor badvpn /usr/local/bin/badvpn-udpgw badvpn-udpgw)"
+        printf " ${B}│${N} %-48s ${B}│${N} %-48s ${B}│${N}\n" "[05] HCR: $(charly_estado_motor hcr /usr/local/bin/HCR HCR)" "[06] SLIPSTREAM: $(charly_estado_motor charly-slipstream /usr/local/bin/slipstream-server slipstream-server)"
+        printf " ${B}└──────────────────────────────────────────────────┴──────────────────────────────────────────────────┘${N}\n"
         echo
         linea
         printf " ${R}[00]${N} ↩  VOLVER AL MENU PRINCIPAL\n"
@@ -229693,6 +229710,7 @@ charly_resumen_puertos() {
         ss -H -lntup 2>/dev/null |
         awk '{
             if ($1=="tcp" && $2!="LISTEN") next
+            if ($1=="udp" && $NF ~ /badvpn-udpgw/) next
             print $1 "|" $5 "|" $NF
         }'
     )
@@ -229706,7 +229724,7 @@ charly_resumen_puertos() {
 
 
 charly_info_vps() {
-    local os ip zona ram swap disco cpu top
+    local os ip zona ram swap disco cpu top charly_id
 
     os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Ubuntu}")
     ip=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null)
@@ -229748,8 +229766,88 @@ charly_info_vps() {
     printf " ${B}├──────────────────────────────────────────┤${N}\n"
     printf " ${B}│${N} ${C}RESELLER:${N} ${Y}%-32.32s${N} ${B}│${N}\n" "No configurado"
     printf " ${B}│${N} ${C}LICENCIA:${N} ${Y}%-32.32s${N} ${B}│${N}\n" "No configurada"
+    printf " ${B}│${N} ${C}CHARLY VPS:${N} ${G}%-32.32s${N} ${B}│${N}\\n" "Version libre"
     printf " ${B}└──────────────────────────────────────────┘${N}\n"
 }
+charly_actualizar_script() {
+    local url tmp nuevo backup
+    url="https://raw.githubusercontent.com/tvmagi009-web/CHARLY-VPS-/main/charly"
+
+    echo
+    echo "Verificando conexión con GitHub..."
+    command -v curl >/dev/null 2>&1 || {
+        echo "ERROR: curl no está instalado."
+        return 1
+    }
+
+    tmp=$(mktemp) || return 1
+    nuevo="/usr/local/bin/charly.nuevo"
+
+    if ! curl -fL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
+        echo "ERROR: no se pudo descargar el script."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]] || ! bash -n "$tmp" ||
+       ! grep -q '^menu_principal()' "$tmp"; then
+        echo "ERROR: el archivo descargado no es un CHARLY válido."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    backup="/usr/local/bin/charly.backup.$(date +%Y%m%d_%H%M%S)"
+    cp -a /usr/local/bin/charly "$backup" || {
+        echo "ERROR: no se pudo crear la copia de seguridad."
+        rm -f "$tmp"
+        return 1
+    }
+
+    if ! install -o root -g root -m 755 "$tmp" "$nuevo"; then
+        rm -f "$tmp" "$nuevo"
+        return 1
+    fi
+
+    rm -f "$tmp"
+    if mv -f "$nuevo" /usr/local/bin/charly; then
+        echo "CHARLY actualizado correctamente."
+        echo "Copia anterior: $backup"
+        echo "Reinicia el menú para cargar la nueva versión."
+        exit 0
+    else
+        echo "ERROR: no se pudo instalar la actualización."
+        rm -f "$nuevo"
+        return 1
+    fi
+}
+
+charly_desinstalar_script() {
+    local confirmacion
+    echo
+    echo "ATENCIÓN: se eliminará únicamente el script principal CHARLY."
+    echo "Se conservarán servicios, túneles, usuarios y configuraciones."
+    echo
+    read -r -p "Escribe DESINSTALAR para confirmar: " confirmacion
+
+    if [[ "$confirmacion" != "DESINSTALAR" ]]; then
+        echo "Desinstalación cancelada."
+        return 0
+    fi
+
+    if [[ -L /usr/local/bin/menu ]]; then
+        if [[ "$(readlink /usr/local/bin/menu)" == "/usr/local/bin/charly" ]]; then
+            rm -f /usr/local/bin/menu
+        else
+            echo "Aviso: el enlace menu no coincide; se conservará."
+        fi
+    fi
+
+    rm -f /usr/local/bin/charly
+    echo "Script CHARLY eliminado."
+    echo "Los servicios y configuraciones se conservaron."
+    exit 0
+}
+
 menu_principal() {
     local op
     CHARLY_OS=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Ubuntu}")
@@ -229784,6 +229882,10 @@ menu_principal() {
         echo
         echo -e "  ${B}[02]${N}  📦 ${C}INSTALADORES${N}"
         echo
+        echo -e "  ${B}[03]${N}  🔄 ${C}ACTUALIZAR SCRIPT${N}"
+        echo
+        echo -e "  ${B}[04]${N}  🗑️  ${R}DESINSTALAR SCRIPT${N}"
+        echo
         linea
         echo
         echo -e "  ${R}[00]${N}  ${R}SALIR${N}"
@@ -229798,6 +229900,8 @@ menu_principal() {
         case "$op" in
             1|01) menu_ssh ;;
             2|02) menu_instaladores ;;
+            3|03) charly_actualizar_script ;;
+            4|04) charly_desinstalar_script ;;
             0|00) clear; exit 0 ;;
             *)
                 echo -e "${R}Opción incorrecta.${N}"
@@ -229807,5 +229911,123 @@ menu_principal() {
         ((CHARLY_CICLO++))
     done
 }
+
+# ===== CHARLY SLIPGATE INSTALLER FIX (official installer runs once) =====
+charly_slipstream_instalar() {
+    local tmp_gate tmp_stream rc
+    echo -e "${C}INSTALADOR OFICIAL SLIPGATE + SLIPSTREAM${N}"
+
+    # Si ya existe una instalación, no volver a instalar ni abrir asistentes.
+    if [[ -x /usr/local/bin/slipgate && -e /etc/slipgate/config.json ]]; then
+        echo -e "${Y}SlipGate ya está instalado. No se sobrescribirá la configuración.${N}"
+        echo
+        /usr/local/bin/slipgate tunnel status
+        return $?
+    fi
+
+    # Restos sin una instalación completa: detenerse para no pisar datos existentes.
+    if [[ -e /etc/slipgate || -e /etc/systemd/system/slipgate-dnsrouter.service || \
+          -e /etc/systemd/system/slipgate-charly.service || -x /usr/local/bin/slipgate ]]; then
+        echo -e "${R}Se detectaron archivos o servicios de SlipGate, pero no una instalación completa.${N}"
+        echo "No se modificó ni eliminó ningún archivo. Revisa la instalación existente antes de continuar."
+        return 1
+    fi
+
+    tmp_gate=$(mktemp) || return 1
+    tmp_stream=$(mktemp) || { rm -f "$tmp_gate"; return 1; }
+    if ! charly_slipgate_motor_embebido | base64 -d >"$tmp_gate" || \
+       [[ "$(sha256sum "$tmp_gate" | awk '{print $1}')" != "$CHARLY_SLIPGATE_SHA" ]]; then
+        rm -f "$tmp_gate" "$tmp_stream"
+        echo -e "${R}No se pudo verificar el motor SlipGate integrado.${N}"
+        return 1
+    fi
+    if ! charly_slipstream_motor_embebido | base64 -d >"$tmp_stream" || \
+       [[ "$(sha256sum "$tmp_stream" | awk '{print $1}')" != "$CHARLY_SLIPSTREAM_SHA" ]]; then
+        rm -f "$tmp_gate" "$tmp_stream"
+        echo -e "${R}No se pudo verificar el motor Slipstream integrado.${N}"
+        return 1
+    fi
+
+    if ! install -o root -g root -m 755 "$tmp_gate" /usr/local/bin/slipgate; then
+        rm -f "$tmp_gate" "$tmp_stream"
+        return 1
+    fi
+    if ! install -o root -g root -m 755 "$tmp_stream" /usr/local/bin/slipstream-server; then
+        rm -f "$tmp_gate" "$tmp_stream"
+        return 1
+    fi
+    rm -f "$tmp_gate" "$tmp_stream"
+
+    echo -e "${G}Motores integrados verificados e instalados.${N}"
+    echo "Iniciando el instalador oficial de SlipGate."
+    echo "El instalador oficial gestiona la creación del túnel; CHARLY no abrirá un segundo asistente."
+    /usr/local/bin/slipgate install
+    rc=$?
+    if (( rc != 0 )); then
+        echo -e "${R}El instalador oficial devolvió error ($rc). No se ejecutará otro asistente ni se crearán configuraciones manuales.${N}"
+        return "$rc"
+    fi
+
+    mkdir -p /etc/charly/slipstream
+    printf 'INSTALLER=slipgate-official\n' > /etc/charly/slipstream/ownership
+    chmod 600 /etc/charly/slipstream/ownership
+
+    echo
+    echo -e "${G}Instalador oficial finalizado. Estado de los túneles:${N}"
+    /usr/local/bin/slipgate tunnel status
+    rc=$?
+    echo
+    echo "Regresando al menú CHARLY. Para crear otro túnel, usa la opción 2 (Administrar túneles)."
+    return "$rc"
+}
+
+menu_slipstream() {
+    local op
+    while true; do
+        clear
+        echo
+        linea
+        printf "          ${C}CHARLY - ADMINISTRADOR SLIPGATE${N}\n"
+        linea
+        if [[ -x /usr/local/bin/slipgate ]]; then
+            echo -e "Motor: ${G}INSTALADO${N} ($(/usr/local/bin/slipgate --version 2>/dev/null | head -1))"
+        else
+            echo -e "Motor: ${R}NO INSTALADO${N}"
+        fi
+        echo
+        echo "  1) Instalar SlipGate + crear túnel (asistente oficial)"
+        echo "  2) Administrar túneles"
+        echo "  3) Administrar usuarios"
+        echo "  4) Estado y diagnóstico"
+        echo "  5) Ver registros"
+        echo "  6) Reiniciar servicios SlipGate"
+        echo "  7) Crear copia de seguridad"
+        echo "  8) Actualizar SlipGate"
+        echo "  9) Desinstalar SlipGate"
+        echo "  0) Volver"
+        linea
+        read -r -p "Opción: " op
+        case "$op" in
+            1) charly_slipstream_instalar ;;
+            2) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate tunnel; else echo "SlipGate no está instalado."; fi ;;
+            3) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate users; else echo "SlipGate no está instalado."; fi ;;
+            4) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate diag; else echo "SlipGate no está instalado."; fi ;;
+            5) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate tunnel logs; else echo "SlipGate no está instalado."; fi ;;
+            6) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate restart; else echo "SlipGate no está instalado."; fi ;;
+            7) if [[ -x /usr/local/bin/slipgate ]]; then /usr/local/bin/slipgate backup; else echo "SlipGate no está instalado."; fi ;;
+            8) if [[ -x /usr/local/bin/slipgate ]]; then read -r -p "¿Actualizar SlipGate? [s/N]: " a; [[ "$a" =~ ^[sS]$ ]] && /usr/local/bin/slipgate update; else echo "SlipGate no está instalado."; fi ;;
+            9) if [[ -x /usr/local/bin/slipgate ]]; then
+                   echo "ATENCIÓN: esto desinstala los componentes gestionados por SlipGate."
+                   read -r -p "Escribe DESINSTALAR para confirmar: " a
+                   [[ "$a" == "DESINSTALAR" ]] && /usr/local/bin/slipgate uninstall
+               else echo "SlipGate no está instalado."; fi ;;
+            0) return ;;
+            *) echo "Opción incorrecta." ;;
+        esac
+        echo
+        read -r -p "Presiona Enter para continuar..."
+    done
+}
+# ===== END CHARLY SLIPGATE INSTALLER FIX =====
 
 menu_principal
