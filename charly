@@ -91,7 +91,7 @@ nuevo_usuario_ssh() {
             continue
         }
 
-        if ! useradd -m -s /bin/bash "$usuario"; then
+        if ! useradd -m -s /bin/false "$usuario"; then
             echo -e "${R}No se pudo crear la cuenta Linux.${N}"
             sleep 2
             continue
