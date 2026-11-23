@@ -315740,43 +315740,7 @@ menu_instaladores() {
 }
 
 
-# Sincroniza UFW con los puertos que CHARLY detecta escuchando en interfaces
-# no-loopback. Solo agrega permisos; nunca elimina reglas existentes.
-charly_ufw_sync_puertos() {
-    local proto estado direccion puerto
-    command -v ufw >/dev/null 2>&1 || return 0
-    ufw status 2>/dev/null | grep -q '^Status: active' || return 0
-
-    while read -r proto estado direccion; do
-        [[ "$proto" == "tcp" || "$proto" == "udp" ]] || continue
-        [[ "$proto" != "tcp" || "$estado" == "LISTEN" ]] || continue
-        [[ "$direccion" == *:* ]] || continue
-
-        # No publicar sockets ligados exclusivamente a loopback.
-        case "$direccion" in
-            127.*:*|\[::1\]:*) continue ;;
-        esac
-
-        puerto="${direccion##*:}"
-        [[ "$puerto" =~ ^[0-9]+$ ]] || continue
-        (( puerto >= 1 && puerto <= 65535 )) || continue
-
-        ufw allow "${puerto}/${proto}" >/dev/null 2>&1 || {
-            echo -e "${Y}Aviso: UFW no pudo autorizar ${puerto}/${proto}.${N}" >&2
-        }
-    done < <(
-        ss -H -lntup 2>/dev/null |
-        awk '{
-            if ($1=="tcp" && $2!="LISTEN") next
-            if ($1!="tcp" && $1!="udp") next
-            print $1, $2, $5
-        }'
-    )
-}
-
-
 charly_resumen_puertos() {
-    charly_ufw_sync_puertos
     local proto addr proc puerto nombre clave
     local tcp="" udp="" tcp_count=0 udp_count=0
     local -A vistos=()
