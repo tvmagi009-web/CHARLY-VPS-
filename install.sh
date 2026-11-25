@@ -17,6 +17,23 @@ if [[ "$EUID" -ne 0 ]]; then
     exit 1
 fi
 
+echo
+echo "Actualizando Ubuntu y los paquetes instalados..."
+export DEBIAN_FRONTEND=noninteractive
+
+if ! apt-get update; then
+    echo "ERROR: no se pudo actualizar la lista de paquetes."
+    exit 1
+fi
+
+if ! apt-get upgrade -y; then
+    echo "ERROR: no se pudieron actualizar los paquetes."
+    exit 1
+fi
+
+echo "Actualización del sistema completada."
+echo
+
 cleanup() {
     rm -f "$TMP"
 }
