@@ -14,7 +14,7 @@ source /etc/CHARLY/modules/charly-id.sh 2>/dev/null || true
 # Esto no habilita una terminal interactiva ni modifica cuentas existentes.
 if [[ "$EUID" -eq 0 ]] && [[ -x /bin/false ]] && [[ -f /etc/shells ]]; then
     if ! grep -qxF '/bin/false' /etc/shells; then
-        printf '%s\\n' '/bin/false' >> /etc/shells || {
+        printf '%s\n' '/bin/false' >> /etc/shells || {
             echo "ERROR: no se pudo agregar /bin/false a /etc/shells." >&2
         }
     fi
