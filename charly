@@ -610,27 +610,52 @@ monitor_usuarios_ssh() {
                 conexiones=${conexiones:-0}
                 segundos=${segundos:-0}
 
-                # Dropbear/BHTTP: usa el registro de autenticación para
-                # asociar usuario-PID y verifica que el PID siga vivo y
-                # conserve una conexión TCP ESTABLISHED.
-                if command -v journalctl >/dev/null 2>&1 &&
-                   command -v ss >/dev/null 2>&1; then
-                    pids_dropbear=$(
-                        journalctl -u dropbear --no-pager -o cat 2>/dev/null |
-                        grep -F "Password auth succeeded for '$u'" |
-                        sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p' |
-                        sort -u
+                # Dropbear/BHTTP: reconstruye las sesiones autenticadas
+                # aplicando también los eventos Exit. Los procesos Dropbear
+                # se ejecutan como root, por eso no se buscan por propietario.
+                if command -v journalctl >/dev/null 2>&1; then
+                    pids_dropbear=$(python3 - "$u" <<'PY_DROPBEAR_ACTIVE'
+import json, os, re, subprocess, sys
+user = sys.argv[1]
+try:
+    raw = subprocess.check_output(
+        ["journalctl", "-t", "dropbear", "-o", "json", "--no-pager"],
+        text=True, stderr=subprocess.DEVNULL)
+except (OSError, subprocess.CalledProcessError):
+    raw = ""
+active = {}
+for line in raw.splitlines():
+    try:
+        msg = str(json.loads(line).get("MESSAGE", ""))
+    except (ValueError, TypeError):
+        continue
+    m = re.search(r"\[(\d+)\]", msg)
+    if not m:
+        continue
+    pid = m.group(1)
+    auth = re.search(r"Password auth succeeded for '([^']+)'", msg)
+    done = re.search(r"Exit \(([^)]+)\)", msg)
+    if auth:
+        active[pid] = auth.group(1)
+    elif done:
+        active.pop(pid, None)
+for pid, owner in active.items():
+    if owner != user or not os.path.exists("/proc/" + pid):
+        continue
+    try:
+        cmd = open("/proc/" + pid + "/cmdline", "rb").read().replace(b"\0", b" ")
+    except OSError:
+        continue
+    if b"dropbear" in cmd:
+        print(pid)
+PY_DROPBEAR_ACTIVE
                     )
 
                     while IFS= read -r pid; do
                         [[ "$pid" =~ ^[0-9]+$ ]] || continue
                         kill -0 "$pid" 2>/dev/null || continue
-                        ss -Htnp state established 2>/dev/null |
-                            grep -Fq "pid=$pid," || continue
-
                         edad=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
                         [[ "$edad" =~ ^[0-9]+$ ]] || edad=0
-
                         conexiones=$((conexiones + 1))
                         (( edad > segundos )) && segundos=$edad
                     done <<< "$pids_dropbear"
@@ -675,27 +700,32 @@ charly_monitor_multilogin_instalar() {
     local monitor="/usr/local/bin/charly-ssh-monitor"
     local unidad="/etc/systemd/system/charly-ssh-monitor.service"
     local tmp
-    if [[ -e "$monitor" || -e "$unidad" ]]; then
-        echo "Ya existe una instalación del monitor. No se sobrescribirá."
-        echo "Usa Estado o Reiniciar para administrar la instalación existente."
-        return 1
+    # Si ya existe, conserva una copia antes de actualizarlo.
+    local sello
+    sello=$(date +%Y%m%d_%H%M%S)
+    if [[ -f "$monitor" ]]; then
+        cp -a "$monitor" "$monitor.backup.$sello" || return 1
+    fi
+    if [[ -f "$unidad" ]]; then
+        cp -a "$unidad" "$unidad.backup.$sello" || return 1
     fi
     tmp=$(mktemp) || return 1
     cat > "$tmp" <<'CHARLY_MONITOR'
 #!/usr/bin/env python3
-import os, pwd, re, signal, subprocess, sys, time
+import json, os, pwd, re, signal, subprocess, sys, time
 DB = "/etc/CHARLY/config/ssh_users.db"
 LOG = "/var/log/charly-ssh-monitor.log"
 INTERVAL = 5
 
+
 def log(msg):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{stamp}] {msg}\n"
     try:
         with open(LOG, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(f"[{stamp}] {msg}\n")
     except OSError:
         pass
+
 
 def limits():
     result = {}
@@ -710,17 +740,68 @@ def limits():
                     continue
                 try:
                     n = int(limit)
-                except (TypeError, ValueError):
+                    pwd.getpwnam(user)
+                except (TypeError, ValueError, KeyError):
                     continue
                 if 1 <= n <= 100:
-                    try:
-                        pwd.getpwnam(user)
-                    except KeyError:
-                        continue
                     result[user] = n
     except FileNotFoundError:
         pass
     return result
+
+
+def proc_start(pid):
+    # Campo 22 de /proc/PID/stat: instante de inicio del proceso.
+    try:
+        raw = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+        tail = raw[raw.rfind(")") + 2:].split()
+        return int(tail[19])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def is_dropbear_session(pid):
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        return "dropbear" in raw
+    except OSError:
+        return False
+
+
+def dropbear_sessions():
+    """Mapea PID->usuario con eventos auth/Exit de syslog dropbear.
+    Si journalctl falla, no inventa sesiones ni mata procesos Dropbear.
+    """
+    try:
+        raw = subprocess.check_output(
+            ["journalctl", "-t", "dropbear", "-o", "json", "--no-pager"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.CalledProcessError):
+        log("ERROR no_se_pudo_leer_journal_dropbear")
+        return {}
+    active = {}
+    for line in raw.splitlines():
+        try:
+            item = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        msg = str(item.get("MESSAGE", ""))
+        # Dropbear imprime [PID] dentro de MESSAGE; _PID puede ser el PID real.
+        m_pid = re.search(r"\[(\d+)\]", msg)
+        pid_text = m_pid.group(1) if m_pid else str(item.get("_PID", ""))
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        auth = re.search(r"Password auth succeeded for '([^']+)'", msg)
+        done = re.search(r"Exit \(([^)]+)\)", msg)
+        if auth:
+            active[pid] = auth.group(1)
+        elif done:
+            active.pop(pid, None)
+    return [(user, pid) for pid, user in active.items()
+            if os.path.exists(f"/proc/{pid}") and is_dropbear_session(pid)]
+
 
 def sessions():
     found = {}
@@ -730,7 +811,7 @@ def sessions():
             stderr=subprocess.DEVNULL
         )
     except (OSError, subprocess.CalledProcessError):
-        return found
+        raw = ""
     for line in raw.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) != 3:
@@ -739,16 +820,18 @@ def sessions():
         if not pid_text.isdigit():
             continue
         pid = int(pid_text)
-        # Solo procesos de sesión; no cuenta el listener root ni procesos ajenos.
         try:
             pwd.getpwnam(owner)
         except KeyError:
             continue
-        if re.match(r"^sshd:\s*" + re.escape(owner) + r"(?:@|\s+\[)", args):
+        # OpenSSH: cuenta solo el proceso de sesión, no sshd: [priv].
+        if re.match(r"^sshd:\s*" + re.escape(owner) + r"(?:@|\s+\[|$)", args):
             found.setdefault(owner, set()).add(pid)
-        elif re.match(r"^dropbear:\s*" + re.escape(owner) + r"\s+\[", args):
-            found.setdefault(owner, set()).add(pid)
+    # Dropbear se ejecuta como root: la asociación usuario-PID sale del journal.
+    for user, pid in dropbear_sessions():
+        found.setdefault(user, set()).add(pid)
     return found
+
 
 def main():
     if os.geteuid() != 0:
@@ -759,29 +842,34 @@ def main():
         configured = limits()
         active = sessions()
         for user, limit in configured.items():
-            pids = sorted(active.get(user, set()))
+            pids = list(active.get(user, set()))
+            # Orden real de antigüedad: inicio más antiguo primero.
+            pids.sort(key=lambda pid: (proc_start(pid), pid))
             count = len(pids)
-            if count > limit:
-                log(f"EXCESO usuario={user} sesiones={count} limite={limit} pids={','.join(map(str,pids))}")
-                # Cierra únicamente procesos de sesión identificados, sin bloquear
-                # la cuenta Linux ni matar procesos ajenos del usuario.
-                for pid in pids:
+            if count <= limit:
+                continue
+            keep, excess = pids[:limit], pids[limit:]
+            log(f"EXCESO usuario={user} sesiones={count} limite={limit} conservar={','.join(map(str, keep))} cerrar={','.join(map(str, excess))}")
+            # Nunca toca las sesiones que están dentro del límite.
+            for pid in excess:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    log(f"ERROR sin_permiso usuario={user} pid={pid}")
+            time.sleep(1)
+            still = sessions().get(user, set())
+            for pid in excess:
+                if pid in still:
                     try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
                         pass
-                    except PermissionError:
-                        log(f"ERROR sin_permiso usuario={user} pid={pid}")
-                time.sleep(1)
-                still = sessions().get(user, set())
-                for pid in pids:
-                    if pid in still:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                log(f"ACCION usuario={user} sesiones_cerradas={count} limite={limit}")
+            remaining = len(sessions().get(user, set()))
+            log(f"ACCION usuario={user} excedentes={len(excess)} sesiones_restantes={remaining} limite={limit}")
         time.sleep(INTERVAL)
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -814,8 +902,13 @@ WantedBy=multi-user.target
 CHARLY_UNIT
     chmod 644 "$unidad"
     systemctl daemon-reload || return 1
-    if systemctl enable --now charly-ssh-monitor.service; then
-        echo "Monitor CHARLY instalado y activo."
+    if systemctl is-active --quiet charly-ssh-monitor.service; then
+        systemctl restart charly-ssh-monitor.service
+    else
+        systemctl enable --now charly-ssh-monitor.service
+    fi
+    if systemctl is-active --quiet charly-ssh-monitor.service; then
+        echo "Monitor CHARLY instalado/actualizado y activo."
         echo "Lee los límites desde /etc/CHARLY/config/ssh_users.db."
         echo "Registro: /var/log/charly-ssh-monitor.log"
     else
